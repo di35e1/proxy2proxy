@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -25,15 +24,15 @@ import (
 )
 
 const (
-	ipBoundIf        = 25 // IP_BOUND_IF на macOS (Darwin)
-	handshakeTimeout = 10 * time.Second
-	retryInterval    = 30 * time.Second
-	sessionDebounce  = 100 * time.Millisecond
-	configFileName   = "config.json"
-	maxClientConns   = 512
-	acceptErrorDelay = 100 * time.Millisecond
-	statusCheckHost  = "example.com"
-	statusCheckPort  = 443
+	ipBoundIf          = 25 // IP_BOUND_IF на macOS (Darwin)
+	handshakeTimeout   = 10 * time.Second
+	retryInterval      = 30 * time.Second
+	statusCheckPeriod  = 30 * time.Second
+	passiveFreshWindow = 5 * time.Minute
+	sessionDebounce    = 100 * time.Millisecond
+	configFileName     = "config.json"
+	maxClientConns     = 512
+	acceptErrorDelay   = 100 * time.Millisecond
 )
 
 type proxyProfile struct {
@@ -45,9 +44,16 @@ type proxyProfile struct {
 }
 
 type externalConfig struct {
-	Listen  string         `json:"listen"`
-	Iface   string         `json:"iface"`
-	Proxies []proxyProfile `json:"proxies"`
+	Listen             string         `json:"listen"`
+	Iface              string         `json:"iface"`
+	StatusCheckTargets []string       `json:"status_check_targets"`
+	Proxies            []proxyProfile `json:"proxies"`
+}
+
+type statusTarget struct {
+	host     string
+	port     uint16
+	addrType byte
 }
 
 type upstreamConfig struct {
@@ -108,6 +114,13 @@ var (
 	globalCfg            upstreamConfig
 	globalListenAddr     string
 	proxyProfiles        []upstreamConfig
+	statusCheckTargets   = defaultStatusCheckTargets()
+	statusCheckMu        sync.Mutex
+	passiveSuccessMu     sync.Mutex
+	passiveSuccessCfg    upstreamConfig
+	passiveSuccessLabel  string
+	passiveSuccessIdx    int
+	passiveSuccessAt     time.Time
 	clientSlots          = make(chan struct{}, maxClientConns)
 	sessionMu            sync.Mutex
 	sessionGeneration    int64
@@ -201,38 +214,15 @@ func main() {
 		fatalStartupError("Ошибка конфига", fmt.Sprintf("Не удалось прочитать %s:\n%v", cfgPath, cfgErr))
 	}
 
-	defListen := "127.0.0.1:1080"
+	listenAddr := "127.0.0.1:1080"
 	if extCfg.Listen != "" {
-		defListen = extCfg.Listen
+		listenAddr = extCfg.Listen
 	}
-	defIface := "en0"
+	ifaceName := "en0"
 	if extCfg.Iface != "" {
-		defIface = extCfg.Iface
+		ifaceName = extCfg.Iface
 	}
-
-	var firstProxy proxyProfile
-	if len(extCfg.Proxies) > 0 {
-		firstProxy = extCfg.Proxies[0]
-	}
-
-	listenAddr := flag.String("listen", defListen, "Локальный адрес SOCKS5")
-	proxyType := flag.String("type", firstProxy.Type, "Тип удалённого прокси: http или socks5")
-	proxyAddr := flag.String("proxy", firstProxy.Addr, "Адрес удалённого прокси (host:port)")
-	proxyUser := flag.String("user", "", "Логин прокси")
-	proxyPass := flag.String("pass", "", "Пароль прокси")
-	ifaceName := flag.String("iface", defIface, "Сетевой интерфейс для исходящего трафика")
-	flag.Parse()
-
-	setFlags := make(map[string]bool)
-	flag.Visit(func(f *flag.Flag) {
-		setFlags[f.Name] = true
-	})
-	if !setFlags["user"] {
-		*proxyUser = firstProxy.User
-	}
-	if !setFlags["pass"] {
-		*proxyPass = firstProxy.Pass
-	}
+	statusCheckTargets = parseStatusCheckTargets(extCfg.StatusCheckTargets)
 
 	profiles := make([]upstreamConfig, 0, len(extCfg.Proxies))
 	for i, p := range extCfg.Proxies {
@@ -253,77 +243,49 @@ func main() {
 		})
 	}
 
-	cliType, cliErr := normalizeProxyType(*proxyType)
-	cliAddr := strings.TrimSpace(*proxyAddr)
-
 	if len(profiles) == 0 {
-		if cliAddr == "" {
-			if cfgMissing {
-				fatalStartupError(
-					"Не найден config.json",
-					fmt.Sprintf("Положите config.json рядом с приложением:\n%s", cfgPath),
-				)
-			}
+		if cfgMissing {
 			fatalStartupError(
-				"Нет валидных прокси в config.json",
-				fmt.Sprintf("В файле %s не найдено ни одного профиля с корректными полями \"type\" (http/socks5) и \"addr\".", cfgPath),
+				"Не найден config.json",
+				fmt.Sprintf("Положите config.json рядом с приложением:\n%s", cfgPath),
 			)
 		}
-
-		if cliErr != nil {
-			fatalStartupError(
-				"Ошибка параметров прокси",
-				fmt.Sprintf("Неизвестный тип прокси %q. Используйте: http или socks5.", *proxyType),
-			)
-		}
-
-		profiles = append(profiles, upstreamConfig{
-			label:     fmt.Sprintf("%s://%s", cliType, cliAddr),
-			proxyType: cliType,
-			proxyAddr: cliAddr,
-			user:      *proxyUser,
-			pass:      *proxyPass,
-		})
+		fatalStartupError(
+			"Нет валидных прокси в config.json",
+			fmt.Sprintf("В файле %s не найдено ни одного профиля с корректными полями \"type\" (http/socks5) и \"addr\".", cfgPath),
+		)
 	}
 
 	activeIdx := 0
-	if cliErr == nil && cliAddr != "" {
-		for i, p := range profiles {
-			if p.proxyType == cliType && p.proxyAddr == cliAddr && p.user == *proxyUser && p.pass == *proxyPass {
-				activeIdx = i
-				break
-			}
-		}
-	}
 
 	proxyProfiles = profiles
-	globalListenAddr = *listenAddr
+	globalListenAddr = listenAddr
 
 	stateMu.Lock()
 	globalCfg = proxyProfiles[activeIdx]
-	currentIfaceName = *ifaceName
-	currentIfaceLabel = *ifaceName
+	currentIfaceName = ifaceName
+	currentIfaceLabel = ifaceName
 	stateMu.Unlock()
 
-	ports := listHardwarePorts(*ifaceName)
-	ifaceDisplay := findPortLabel(ports, *ifaceName)
+	ports := listHardwarePorts(ifaceName)
+	ifaceDisplay := findPortLabel(ports, ifaceName)
 	stateMu.Lock()
 	currentIfaceLabel = ifaceDisplay
 	stateMu.Unlock()
 
-	infoText := formatRouteInfo(*listenAddr, proxyProfiles[activeIdx], ifaceDisplay)
+	infoText := formatRouteInfo(listenAddr, proxyProfiles[activeIdx], ifaceDisplay)
 	setupWindow("Proxy2Proxy", infoText)
 
 	foundDefault := false
 	for _, p := range ports {
-		isDef := p.bsdName == *ifaceName
+		isDef := p.bsdName == ifaceName
 		if isDef {
 			foundDefault = true
 		}
 		addWindowInterfaceOption(p.label, p.bsdName, isDef)
 	}
-	if !foundDefault && *ifaceName != "" {
-		addWindowInterfaceOption(*ifaceName, *ifaceName, true)
+	if !foundDefault && ifaceName != "" {
+		addWindowInterfaceOption(ifaceName, ifaceName, true)
 	}
 
 	for i, p := range proxyProfiles {
@@ -648,6 +610,7 @@ func startProxyServer() {
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
 	}
+	go statusMonitorLoop()
 
 	for {
 		clientConn, err := listener.Accept()
@@ -715,7 +678,70 @@ func notifySessionCountChanged() {
 	})
 }
 
+func defaultStatusCheckTargets() []statusTarget {
+	return []statusTarget{
+		{host: "example.com", port: 443, addrType: 0x03},
+		{host: "example.org", port: 443, addrType: 0x03},
+		{host: "one.one.one.one", port: 443, addrType: 0x03},
+	}
+}
+
+func parseStatusCheckTargets(raw []string) []statusTarget {
+	targets := make([]statusTarget, 0, len(raw))
+	for _, item := range raw {
+		host, portText, err := net.SplitHostPort(strings.TrimSpace(item))
+		if err != nil {
+			continue
+		}
+		port, err := strconv.Atoi(portText)
+		if err != nil || port <= 0 || port > 65535 {
+			continue
+		}
+		addrType := byte(0x03)
+		if ip := net.ParseIP(host); ip != nil {
+			if ip.To4() != nil {
+				addrType = 0x01
+			} else {
+				addrType = 0x04
+			}
+		}
+		if err := validateTarget(addrType, host, uint16(port)); err != nil {
+			continue
+		}
+		targets = append(targets, statusTarget{host: host, port: uint16(port), addrType: addrType})
+	}
+	if len(targets) == 0 {
+		return defaultStatusCheckTargets()
+	}
+	return targets
+}
+
+func passiveSuccessFresh(cfg upstreamConfig, label string, idx int) bool {
+	passiveSuccessMu.Lock()
+	defer passiveSuccessMu.Unlock()
+	return passiveSuccessCfg == cfg && passiveSuccessLabel == label && passiveSuccessIdx == idx && !passiveSuccessAt.IsZero() && time.Since(passiveSuccessAt) < passiveFreshWindow
+}
+
+func markRouteSuccess(cfg upstreamConfig, label string, idx int, passive bool) {
+	wasFresh := passiveSuccessFresh(cfg, label, idx)
+
+	passiveSuccessMu.Lock()
+	passiveSuccessCfg = cfg
+	passiveSuccessLabel = label
+	passiveSuccessIdx = idx
+	passiveSuccessAt = time.Now()
+	passiveSuccessMu.Unlock()
+
+	if passive && !wasFresh && routeStillCurrent(cfg, label, idx) {
+		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label))
+		setDockBadgeStatus(dockStatusGreen)
+	}
+}
+
 func checkRemoteOnce() bool {
+	statusCheckMu.Lock()
+	defer statusCheckMu.Unlock()
+
 	idx := refreshSelectedInterface()
 	cfg, label := getCurrentConfigAndIface()
 
@@ -734,47 +760,76 @@ func checkRemoteOnce() bool {
 		return false
 	}
 
-	start := time.Now()
-	conn, err := dialBound(cfg.proxyAddr, idx)
-	if err != nil {
+	// Гибридная проверка: свежий успешный реальный CONNECT уже доказывает,
+	// что текущий маршрут работает, поэтому синтетическую проверку не делаем.
+	if passiveSuccessFresh(cfg, label, idx) {
 		if routeStillCurrent(cfg, label, idx) {
-			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-			setDockBadgeStatus(dockStatusRed)
+			setDockBadgeStatus(dockStatusGreen)
 		}
-		return false
+		return true
 	}
-	if err := checkUpstreamHandshake(cfg, conn); err != nil {
+
+	// Активная часть: пробуем контрольные цели по очереди. Успех любой цели
+	// означает, что интерфейс, upstream и авторизация работают; одна
+	// заблокированная цель не должна красить статус в красный.
+	for _, target := range statusCheckTargets {
+		start := time.Now()
+		conn, err := dialBound(cfg.proxyAddr, idx)
+		if err != nil {
+			continue
+		}
+		if err := checkUpstreamHandshake(cfg, conn, target); err != nil {
+			conn.Close()
+			continue
+		}
 		conn.Close()
-		if routeStillCurrent(cfg, label, idx) {
-			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-			setDockBadgeStatus(dockStatusRed)
+		if !routeStillCurrent(cfg, label, idx) {
+			// Маршрут сменился, пока шла проверка: её успех относится к старому
+			// маршруту. Возвращаем false, чтобы проверка повторилась для нового.
+			return false
 		}
-		return false
+		ms := time.Since(start).Milliseconds()
+		markRouteSuccess(cfg, label, idx, false)
+		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms))
+		setDockBadgeStatus(dockStatusGreen)
+		return true
 	}
-	conn.Close()
-	if !routeStillCurrent(cfg, label, idx) {
-		// Маршрут сменился, пока шла проверка: её успех относится к старому
-		// маршруту. Возвращаем false, чтобы retry-цикл перепроверил новый.
-		return false
+
+	if routeStillCurrent(cfg, label, idx) {
+		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
+		setDockBadgeStatus(dockStatusRed)
 	}
-	ms := time.Since(start).Milliseconds()
-	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms))
-	setDockBadgeStatus(dockStatusGreen)
-	return true
+	return false
 }
 
-func checkUpstreamHandshake(cfg upstreamConfig, conn net.Conn) error {
+func checkUpstreamHandshake(cfg upstreamConfig, conn net.Conn, target statusTarget) error {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 
 	switch cfg.proxyType {
 	case "http":
-		_, _, err := handshakeHTTP(conn, cfg, statusCheckHost, statusCheckPort)
+		_, _, err := handshakeHTTP(conn, cfg, target.host, target.port)
 		return err
 	case "socks5":
-		_, _, err := handshakeSOCKS5(conn, cfg, 0x03, statusCheckHost, statusCheckPort)
+		_, _, err := handshakeSOCKS5(conn, cfg, target.addrType, target.host, target.port)
 		return err
 	default:
 		return fmt.Errorf("неподдерживаемый тип прокси: %s", cfg.proxyType)
+	}
+}
+
+func statusMonitorLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Паника в мониторе статуса: %v", r)
+		}
+	}()
+
+	ticker := time.NewTicker(statusCheckPeriod)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !checkRemoteOnce() {
+			ensureRetryLoop()
+		}
 	}
 }
 
@@ -905,14 +960,19 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 
-	cfg, _ := getCurrentConfigAndIface()
+	cfg, ifaceLabel := getCurrentConfigAndIface()
 	ifaceIdx := refreshSelectedInterface()
 	upstreamConn, preBuffered, err := connectUpstream(cfg, ifaceIdx, addrType, targetHost, targetPort)
 	if err != nil {
+		// Ошибка одного реального соединения может быть проблемой конкретного
+		// сайта, поэтому не красим статус сразу: активная проверка решит,
+		// жив ли маршрут.
+		ensureRetryLoop()
 		_, _ = clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer upstreamConn.Close()
+	markRouteSuccess(cfg, ifaceLabel, ifaceIdx, true)
 
 	_ = clientConn.SetDeadline(time.Time{})
 	_ = upstreamConn.SetDeadline(time.Time{})
