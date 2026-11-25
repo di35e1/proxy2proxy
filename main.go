@@ -408,7 +408,7 @@ func normalizeProxyType(raw string) (string, error) {
 }
 
 func formatRouteInfo(listenAddr string, cfg upstreamConfig, ifaceDisplay string) string {
-	return fmt.Sprintf("Маршрут: %s → %s [%s://%s] (через %s)\nЗакройте окно, чтобы остановить сервис.",
+	return fmt.Sprintf("Маршрут: %s → %s (%s://%s) через %s. Закройте окно, чтобы остановить сервис.",
 		listenAddr, cfg.label, cfg.proxyType, cfg.proxyAddr, ifaceDisplay)
 }
 
