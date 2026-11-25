@@ -1,0 +1,9 @@
+config.go
+config.json
+icon_1024.png
+proxy2proxy
+proxy2proxy_arm64
+proxy2proxy_amd64
+proxy2proxy_universal
+*.app
+.DS_Store

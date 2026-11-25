@@ -1,0 +1,21 @@
+
+{
+  "listen": "127.0.0.1:1080",
+  "iface": "en0",
+  "proxies": [
+    {
+      "name": "EU SOCKS5",
+      "type": "socks5",
+      "addr": "203.0.113.10:1080",
+      "user": "my_login",
+      "pass": "my_password"
+    },
+    {
+      "name": "US HTTP",
+      "type": "http",
+      "addr": "198.51.100.25:8080",
+      "user": "user2",
+      "pass": "pass2"
+    }
+  ]
+}
