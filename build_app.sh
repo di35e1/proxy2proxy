@@ -17,7 +17,6 @@ cd "$SCRIPT_DIR"
 
 echo "1/3. Останавливаем запущенный процесс и очищаем старую сборку..."
 pkill -f "$BIN_PATH" 2>/dev/null || true
-pkill -x "$APP_NAME" 2>/dev/null || true
 rm -f "${TMP_BIN}"
 rm -rf "${OUT_APP}"
 
