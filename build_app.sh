@@ -76,6 +76,10 @@ elif [ -f "${SCRIPT_DIR}/config.example.json" ] && [ ! -f "${TARGET_DIR}/config.
     echo "Скопирован шаблон в ${TARGET_DIR}/config.json"
 fi
 
+if [ -f "${TARGET_DIR}/config.json" ]; then
+    chmod 600 "${TARGET_DIR}/config.json"
+fi
+
 codesign --force --deep --sign - "${OUT_APP}"
 touch "${OUT_APP}"
 
