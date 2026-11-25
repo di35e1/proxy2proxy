@@ -84,10 +84,13 @@ static NSImage *renderDockIcon(NSImage *base, int state) {
     [squirclePath fill];
     [NSGraphicsContext restoreGraphicsState];
 
-    // Обрезка по скруглённому контуру и отрисовка самой иконки
+    // AppIcon.icns уже содержит squircle-геометрию с прозрачными углами,
+    // поэтому базовую иконку рисуем на весь холст. Повторная отрисовка в
+    // iconRect уменьшила бы её второй раз; clip остаётся как страховка для
+    // fallback-иконок без прозрачной маски.
     [NSGraphicsContext saveGraphicsState];
     [squirclePath addClip];
-    [base drawInRect:iconRect
+    [base drawInRect:NSMakeRect(0, 0, canvasSize.width, canvasSize.height)
             fromRect:NSZeroRect
            operation:NSCompositingOperationSourceOver
             fraction:1.0];
