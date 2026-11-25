@@ -98,10 +98,12 @@ var (
 	upRateBps            int64
 	currentIfaceIndex    int64
 	retryingRemote       atomic.Bool
+	windowRunning        atomic.Bool
 	sessionNotifyTimerMu sync.Mutex
 	sessionNotifyTimer   *time.Timer
 	stateMu              sync.RWMutex
 	localState           string
+	currentIfaceName     string
 	currentIfaceLabel    string
 	globalCfg            upstreamConfig
 	globalListenAddr     string
@@ -143,6 +145,21 @@ func showFallbackDialog(title, msg string) {
 
 func alertError(title, msg string, critical bool) {
 	log.Printf("[%s] %s", title, msg)
+	if windowRunning.Load() {
+		// Окно уже работает: нативный алерт сам дождётся нажатия OK.
+		// Fallback по таймауту здесь нельзя показывать, иначе через 3 секунды
+		// поверх ещё открытого нативного алерта появится второй диалог.
+		func() {
+			defer func() {
+				if recover() != nil {
+					showFallbackDialog(title, msg)
+				}
+			}()
+			showAlert(title, msg, critical)
+		}()
+		return
+	}
+
 	done := make(chan struct{}, 1)
 	go func() {
 		defer func() {
@@ -284,6 +301,7 @@ func main() {
 
 	stateMu.Lock()
 	globalCfg = proxyProfiles[activeIdx]
+	currentIfaceName = *ifaceName
 	currentIfaceLabel = *ifaceName
 	stateMu.Unlock()
 
@@ -316,7 +334,7 @@ func main() {
 
 	go func() {
 		defer recoverAndAlert("Сбой в сетевом потоке прокси")
-		startProxyServer(*ifaceName, ifaceDisplay)
+		startProxyServer()
 	}()
 
 	runWindow()
@@ -473,6 +491,56 @@ func getCurrentConfigAndIface() (upstreamConfig, string) {
 	return cfg, ifaceLabel
 }
 
+// routeStillCurrent сообщает, что маршрут, для которого шла проверка,
+// всё ещё выбран: пока проверка ходила в сеть, конфиг, подпись интерфейса
+// и его индекс не сменились. Иначе результат проверки устарел и статус
+// по нему ставить нельзя.
+func routeStillCurrent(cfg upstreamConfig, label string, idx int) bool {
+	currentCfg, currentLabel := getCurrentConfigAndIface()
+	return currentCfg == cfg && currentLabel == label && int(atomic.LoadInt64(&currentIfaceIndex)) == idx
+}
+
+// refreshSelectedInterface заново находит выбранный интерфейс по имени и
+// обновляет его индекс. Это позволяет запуску и retry-циклу восстановиться,
+// если интерфейс из конфига отсутствовал при старте, а потом появился или
+// пользователь выбрал другой интерфейс.
+func refreshSelectedInterface() int {
+	stateMu.RLock()
+	name := currentIfaceName
+	stateMu.RUnlock()
+
+	if name == "" {
+		atomic.StoreInt64(&currentIfaceIndex, 0)
+		return 0
+	}
+
+	iface, err := net.InterfaceByName(name)
+	if err != nil || !interfaceReady(iface) {
+		atomic.StoreInt64(&currentIfaceIndex, 0)
+		return 0
+	}
+
+	atomic.StoreInt64(&currentIfaceIndex, int64(iface.Index))
+	return iface.Index
+}
+
+func interfaceReady(iface *net.Interface) bool {
+	if (iface.Flags & net.FlagUp) == 0 {
+		return false
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
+			return true
+		}
+	}
+	return false
+}
+
 func registerSession(conn net.Conn) {
 	sessionMu.Lock()
 	activeSessions[conn] = sessionGeneration
@@ -509,6 +577,7 @@ func switchInterface(bsdName string) {
 	label := findPortLabel(ports, bsdName)
 
 	stateMu.Lock()
+	currentIfaceName = bsdName
 	currentIfaceLabel = label
 	cfg := globalCfg
 	stateMu.Unlock()
@@ -554,24 +623,14 @@ func switchProxy(index int) {
 	}
 }
 
-func startProxyServer(ifaceName, ifaceDisplay string) {
-	setLocalState(fmt.Sprintf("⏳ Локальный SOCKS5: ожидание %s...", ifaceDisplay))
+func startProxyServer() {
+	setLocalState("⏳ Локальный SOCKS5: запуск...")
 	setWindowStatus(getLocalStatusLine(), "Удалённый прокси: ожидание сети...")
 
-	iface, err := waitForInterface(ifaceName, 2*time.Minute)
-	if err != nil {
-		setLocalState("❌ Локальный SOCKS5: интерфейс не готов")
-		setWindowStatus(getLocalStatusLine(), err.Error())
-		setDockBadgeStatus(dockStatusRed)
-		alertError("Ошибка сети", err.Error(), false)
-		return
-	}
-
-	atomic.StoreInt64(&currentIfaceIndex, int64(iface.Index))
-	stateMu.Lock()
-	currentIfaceLabel = ifaceDisplay
-	stateMu.Unlock()
-
+	// Listener запускается независимо от готовности выбранного интерфейса:
+	// если интерфейс из конфига отсутствует, локальный SOCKS всё равно должен
+	// слушать порт, а пользователь сможет переключиться на существующий
+	// интерфейс в окне. Доступность маршрута покажет checkRemoteOnce.
 	listener, err := net.Listen("tcp", globalListenAddr)
 	if err != nil {
 		errMsg := fmt.Sprintf("Не удалось открыть порт %s:\n%v", globalListenAddr, err)
@@ -657,34 +716,47 @@ func notifySessionCountChanged() {
 }
 
 func checkRemoteOnce() bool {
-	idx := int(atomic.LoadInt64(&currentIfaceIndex))
+	idx := refreshSelectedInterface()
 	cfg, label := getCurrentConfigAndIface()
 
 	if idx == 0 {
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 Интерфейс %s не активен", label))
-		setDockBadgeStatus(dockStatusRed)
+		if routeStillCurrent(cfg, label, idx) {
+			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 Интерфейс %s не активен", label))
+			setDockBadgeStatus(dockStatusRed)
+		}
 		return false
 	}
 	if cfg.proxyAddr == "" {
-		setWindowStatus(getLocalStatusLine(), "🔴 Прокси не задан")
-		setDockBadgeStatus(dockStatusRed)
+		if routeStillCurrent(cfg, label, idx) {
+			setWindowStatus(getLocalStatusLine(), "🔴 Прокси не задан")
+			setDockBadgeStatus(dockStatusRed)
+		}
 		return false
 	}
 
 	start := time.Now()
 	conn, err := dialBound(cfg.proxyAddr, idx)
 	if err != nil {
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-		setDockBadgeStatus(dockStatusRed)
+		if routeStillCurrent(cfg, label, idx) {
+			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
+			setDockBadgeStatus(dockStatusRed)
+		}
 		return false
 	}
 	if err := checkUpstreamHandshake(cfg, conn); err != nil {
 		conn.Close()
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-		setDockBadgeStatus(dockStatusRed)
+		if routeStillCurrent(cfg, label, idx) {
+			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
+			setDockBadgeStatus(dockStatusRed)
+		}
 		return false
 	}
 	conn.Close()
+	if !routeStillCurrent(cfg, label, idx) {
+		// Маршрут сменился, пока шла проверка: её успех относится к старому
+		// маршруту. Возвращаем false, чтобы retry-цикл перепроверил новый.
+		return false
+	}
 	ms := time.Since(start).Milliseconds()
 	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms))
 	setDockBadgeStatus(dockStatusGreen)
@@ -724,29 +796,6 @@ func ensureRetryLoop() {
 			}
 		}
 	}()
-}
-
-func waitForInterface(name string, timeout time.Duration) (*net.Interface, error) {
-	deadline := time.Now().Add(timeout)
-
-	for {
-		iface, err := net.InterfaceByName(name)
-		if err == nil && (iface.Flags&net.FlagUp) != 0 {
-			addrs, err := iface.Addrs()
-			if err == nil {
-				for _, addr := range addrs {
-					if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
-						return iface, nil
-					}
-				}
-			}
-		}
-
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("таймаут ожидания IP на %s (%v)", name, timeout)
-		}
-		time.Sleep(2 * time.Second)
-	}
 }
 
 func dialBound(addr string, ifaceIndex int) (net.Conn, error) {
@@ -857,7 +906,7 @@ func handleClient(clientConn net.Conn) {
 	}
 
 	cfg, _ := getCurrentConfigAndIface()
-	ifaceIdx := int(atomic.LoadInt64(&currentIfaceIndex))
+	ifaceIdx := refreshSelectedInterface()
 	upstreamConn, preBuffered, err := connectUpstream(cfg, ifaceIdx, addrType, targetHost, targetPort)
 	if err != nil {
 		_, _ = clientConn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -941,8 +990,10 @@ func connectUpstream(cfg upstreamConfig, ifaceIdx int, addrType byte, targetHost
 	rawConn, err := dialBound(cfg.proxyAddr, ifaceIdx)
 	if err != nil {
 		_, label := getCurrentConfigAndIface()
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-		setDockBadgeStatus(dockStatusRed)
+		if routeStillCurrent(cfg, label, ifaceIdx) {
+			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
+			setDockBadgeStatus(dockStatusRed)
+		}
 		ensureRetryLoop()
 		return nil, nil, err
 	}

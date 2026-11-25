@@ -102,5 +102,6 @@ func setWindowStatus(localText, remoteText string) {
 }
 
 func runWindow() {
+	windowRunning.Store(true)
 	C.runEventLoop()
 }
