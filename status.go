@@ -64,21 +64,27 @@ func setRemoteFinalStatus(text string, state int) {
 	setDockBadgeStatus(state)
 }
 
-func passiveSuccessFresh(cfg upstreamConfig, label string, idx int) bool {
+func passiveSuccessFreshWithin(cfg upstreamConfig, label string, idx int, window time.Duration) bool {
 	passiveSuccessMu.Lock()
 	defer passiveSuccessMu.Unlock()
-	return passiveSuccessCfg == cfg && passiveSuccessLabel == label && passiveSuccessIdx == idx && !passiveSuccessAt.IsZero() && time.Since(passiveSuccessAt) < passiveFreshWindow
+	return passiveSuccessCfg == cfg && passiveSuccessLabel == label && passiveSuccessIdx == idx && !passiveSuccessAt.IsZero() && time.Since(passiveSuccessAt) < window
+}
+
+func passiveSuccessFresh(cfg upstreamConfig, label string, idx int) bool {
+	return passiveSuccessFreshWithin(cfg, label, idx, passiveFreshWindow)
 }
 
 func markRouteSuccess(cfg upstreamConfig, label string, idx int, passive bool) {
 	wasFresh := passiveSuccessFresh(cfg, label, idx)
 
-	passiveSuccessMu.Lock()
-	passiveSuccessCfg = cfg
-	passiveSuccessLabel = label
-	passiveSuccessIdx = idx
-	passiveSuccessAt = time.Now()
-	passiveSuccessMu.Unlock()
+	if passive {
+		passiveSuccessMu.Lock()
+		passiveSuccessCfg = cfg
+		passiveSuccessLabel = label
+		passiveSuccessIdx = idx
+		passiveSuccessAt = time.Now()
+		passiveSuccessMu.Unlock()
+	}
 
 	if passive && routeStillCurrent(cfg, label, idx) {
 		// Если окно сейчас показывает "проверка связи", свежий реальный
@@ -112,11 +118,18 @@ func checkRemoteOnce() bool {
 		return false
 	}
 
-	// Гибридная проверка: свежий успешный реальный CONNECT уже доказывает,
-	// что текущий маршрут работает, поэтому синтетическую проверку не делаем.
-	if passiveSuccessFresh(cfg, label, idx) {
+	// Гибридная проверка: совсем свежий успешный реальный CONNECT уже
+	// доказывает, что текущий маршрут работает, поэтому синтетическую
+	// проверку в этом тике не делаем. Окно подавления короткое: без
+	// реального трафика активная проверка должна обновлять пинг каждые
+	// statusCheckPeriod, а не ждать passiveFreshWindow.
+	if passiveSuccessFreshWithin(cfg, label, idx, passiveSuppressWindow) {
 		if routeStillCurrent(cfg, label, idx) {
-			setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
+			if remoteChecking.Load() {
+				setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
+			} else {
+				setDockBadgeStatus(dockStatusGreen)
+			}
 		}
 		return true
 	}

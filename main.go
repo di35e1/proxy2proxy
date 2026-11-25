@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	ipBoundIf          = 25 // IP_BOUND_IF на macOS (Darwin)
-	handshakeTimeout   = 10 * time.Second
-	retryInterval      = 30 * time.Second
-	statusCheckPeriod  = 30 * time.Second
-	passiveFreshWindow = 5 * time.Minute
-	sessionDebounce    = 100 * time.Millisecond
-	configFileName     = "config.json"
-	maxClientConns     = 512
-	acceptErrorDelay   = 100 * time.Millisecond
+	ipBoundIf             = 25 // IP_BOUND_IF на macOS (Darwin)
+	handshakeTimeout      = 10 * time.Second
+	retryInterval         = 30 * time.Second
+	statusCheckPeriod     = 30 * time.Second
+	passiveSuppressWindow = 30 * time.Second
+	passiveFreshWindow    = 5 * time.Minute
+	sessionDebounce       = 100 * time.Millisecond
+	configFileName        = "config.json"
+	maxClientConns        = 512
+	acceptErrorDelay      = 100 * time.Millisecond
 )
 
 var (
