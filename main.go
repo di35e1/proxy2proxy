@@ -121,6 +121,7 @@ var (
 	passiveSuccessLabel  string
 	passiveSuccessIdx    int
 	passiveSuccessAt     time.Time
+	remoteChecking       atomic.Bool
 	clientSlots          = make(chan struct{}, maxClientConns)
 	sessionMu            sync.Mutex
 	sessionGeneration    int64
@@ -550,15 +551,14 @@ func switchInterface(bsdName string) {
 	if err != nil {
 		atomic.StoreInt64(&currentIfaceIndex, 0)
 		closeActiveSessions()
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 Интерфейс %s не найден в системе", label))
-		setDockBadgeStatus(dockStatusRed)
+		setRemoteFinalStatus(fmt.Sprintf("🔴 Интерфейс %s не найден в системе", label), dockStatusRed)
 		ensureRetryLoop()
 		return
 	}
 
 	atomic.StoreInt64(&currentIfaceIndex, int64(iface.Index))
 	closeActiveSessions()
-	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("⏳ Проверка связи через %s...", label))
+	setRemoteCheckingStatus(fmt.Sprintf("⏳ Проверка связи через %s...", label))
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
 	}
@@ -579,7 +579,7 @@ func switchProxy(index int) {
 
 	setWindowInfo(formatRouteInfo(globalListenAddr, cfg, ifaceLabel))
 	closeActiveSessions()
-	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("⏳ Проверка %s (%s)...", cfg.label, ifaceLabel))
+	setRemoteCheckingStatus(fmt.Sprintf("⏳ Проверка %s (%s)...", cfg.label, ifaceLabel))
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
 	}
@@ -597,6 +597,7 @@ func startProxyServer() {
 	if err != nil {
 		errMsg := fmt.Sprintf("Не удалось открыть порт %s:\n%v", globalListenAddr, err)
 		setLocalState("❌ Локальный SOCKS5: порт занят или недоступен")
+		remoteChecking.Store(false)
 		setWindowStatus(getLocalStatusLine(), err.Error())
 		setDockBadgeStatus(dockStatusRed)
 		alertError("Ошибка запуска сервера", errMsg, true)
@@ -605,7 +606,7 @@ func startProxyServer() {
 	defer listener.Close()
 
 	setLocalState("🟢 Локальный SOCKS5")
-	setWindowStatus(getLocalStatusLine(), "⏳ Удалённый прокси: проверка связи...")
+	setRemoteCheckingStatus("⏳ Удалённый прокси: проверка связи...")
 
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
@@ -716,6 +717,17 @@ func parseStatusCheckTargets(raw []string) []statusTarget {
 	return targets
 }
 
+func setRemoteCheckingStatus(text string) {
+	remoteChecking.Store(true)
+	setWindowStatus(getLocalStatusLine(), text)
+}
+
+func setRemoteFinalStatus(text string, state int) {
+	remoteChecking.Store(false)
+	setWindowStatus(getLocalStatusLine(), text)
+	setDockBadgeStatus(state)
+}
+
 func passiveSuccessFresh(cfg upstreamConfig, label string, idx int) bool {
 	passiveSuccessMu.Lock()
 	defer passiveSuccessMu.Unlock()
@@ -732,9 +744,15 @@ func markRouteSuccess(cfg upstreamConfig, label string, idx int, passive bool) {
 	passiveSuccessAt = time.Now()
 	passiveSuccessMu.Unlock()
 
-	if passive && !wasFresh && routeStillCurrent(cfg, label, idx) {
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label))
-		setDockBadgeStatus(dockStatusGreen)
+	if passive && routeStillCurrent(cfg, label, idx) {
+		// Если окно сейчас показывает "проверка связи", свежий реальный
+		// CONNECT должен сразу заменить её зелёным статусом, даже когда
+		// предыдущий успех для этого маршрута ещё считался свежим.
+		if !wasFresh || remoteChecking.Load() {
+			setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
+		} else {
+			setDockBadgeStatus(dockStatusGreen)
+		}
 	}
 }
 
@@ -747,15 +765,13 @@ func checkRemoteOnce() bool {
 
 	if idx == 0 {
 		if routeStillCurrent(cfg, label, idx) {
-			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 Интерфейс %s не активен", label))
-			setDockBadgeStatus(dockStatusRed)
+			setRemoteFinalStatus(fmt.Sprintf("🔴 Интерфейс %s не активен", label), dockStatusRed)
 		}
 		return false
 	}
 	if cfg.proxyAddr == "" {
 		if routeStillCurrent(cfg, label, idx) {
-			setWindowStatus(getLocalStatusLine(), "🔴 Прокси не задан")
-			setDockBadgeStatus(dockStatusRed)
+			setRemoteFinalStatus("🔴 Прокси не задан", dockStatusRed)
 		}
 		return false
 	}
@@ -764,7 +780,7 @@ func checkRemoteOnce() bool {
 	// что текущий маршрут работает, поэтому синтетическую проверку не делаем.
 	if passiveSuccessFresh(cfg, label, idx) {
 		if routeStillCurrent(cfg, label, idx) {
-			setDockBadgeStatus(dockStatusGreen)
+			setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
 		}
 		return true
 	}
@@ -773,6 +789,12 @@ func checkRemoteOnce() bool {
 	// означает, что интерфейс, upstream и авторизация работают; одна
 	// заблокированная цель не должна красить статус в красный.
 	for _, target := range statusCheckTargets {
+		if passiveSuccessFresh(cfg, label, idx) {
+			if routeStillCurrent(cfg, label, idx) {
+				setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
+			}
+			return true
+		}
 		start := time.Now()
 		conn, err := dialBound(cfg.proxyAddr, idx)
 		if err != nil {
@@ -790,14 +812,18 @@ func checkRemoteOnce() bool {
 		}
 		ms := time.Since(start).Milliseconds()
 		markRouteSuccess(cfg, label, idx, false)
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms))
-		setDockBadgeStatus(dockStatusGreen)
+		setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms), dockStatusGreen)
 		return true
 	}
 
+	if passiveSuccessFresh(cfg, label, idx) {
+		if routeStillCurrent(cfg, label, idx) {
+			setRemoteFinalStatus(fmt.Sprintf("🟢 %s (%s): доступен", cfg.label, label), dockStatusGreen)
+		}
+		return true
+	}
 	if routeStillCurrent(cfg, label, idx) {
-		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-		setDockBadgeStatus(dockStatusRed)
+		setRemoteFinalStatus(fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label), dockStatusRed)
 	}
 	return false
 }
@@ -1051,8 +1077,7 @@ func connectUpstream(cfg upstreamConfig, ifaceIdx int, addrType byte, targetHost
 	if err != nil {
 		_, label := getCurrentConfigAndIface()
 		if routeStillCurrent(cfg, label, ifaceIdx) {
-			setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
-			setDockBadgeStatus(dockStatusRed)
+			setRemoteFinalStatus(fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label), dockStatusRed)
 		}
 		ensureRetryLoop()
 		return nil, nil, err
