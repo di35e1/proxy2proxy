@@ -58,7 +58,7 @@ var (
 
 func main() {
 	runtime.LockOSThread()
-	setupFileLogger()
+	setupLogger()
 	defer recoverAndAlert("Сбой в главном потоке")
 
 	extCfg, cfgPath, cfgMissing, cfgErr := loadExternalConfig()

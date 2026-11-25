@@ -31,7 +31,9 @@ func dialBound(addr string, ifaceIndex int) (net.Conn, error) {
 			return sockErr
 		},
 	}
-	return dialer.Dial("tcp", addr)
+	// Upstream intentionally uses IPv4 only: IP_BOUND_IF is the IPv4
+	// interface-binding option, and IPv6 upstream support is out of scope.
+	return dialer.Dial("tcp4", addr)
 }
 
 func connectUpstream(cfg upstreamConfig, ifaceIdx int, addrType byte, targetHost string, targetPort uint16) (net.Conn, []byte, error) {

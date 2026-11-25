@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#include <os/log.h>
 #include <stdlib.h>
 
 extern void goInterfaceSelected(const char* bsdName);
@@ -16,6 +17,18 @@ static NSInteger lastDockStatus = -1;
 static BOOL exceptionHandlerInstalled = NO;
 
 void showAlertDialog(const char* title, const char* message, int critical);
+
+void logUnified(const char* message) {
+    if (message == NULL) {
+        return;
+    }
+    static os_log_t appLog = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        appLog = os_log_create("local.di35e1.proxy2proxy", "app");
+    });
+    os_log_with_type(appLog, OS_LOG_TYPE_DEFAULT, "%{public}s", message);
+}
 
 static void uncaughtExceptionHandler(NSException *exception) {
     NSString *reason = exception.reason ?: @"Неизвестное исключение Cocoa";

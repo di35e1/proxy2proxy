@@ -6,27 +6,22 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
 )
 
-func setupFileLogger() {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return
-	}
-	logDir := filepath.Join(home, "Library", "Logs")
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return
-	}
-	logPath := filepath.Join(logDir, "proxy2proxy.log")
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+type unifiedLogWriter struct{}
+
+func (unifiedLogWriter) Write(p []byte) (int, error) {
+	writeUnifiedLog(strings.TrimRight(string(p), "\n"))
+	return len(p), nil
+}
+
+func setupLogger() {
+	// macOS unified log is the system-managed place for app diagnostics:
+	// Console.app and `log show` read it, and the system handles retention.
+	log.SetOutput(io.MultiWriter(os.Stderr, unifiedLogWriter{}))
 }
 
 func showFallbackDialog(title, msg string) {

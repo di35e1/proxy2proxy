@@ -14,6 +14,7 @@ void setWindowInfo(const char* infoText);
 void updateLocalStatus(const char* localText);
 void updateStatus(const char* localText, const char* remoteText);
 void runEventLoop(void);
+void logUnified(const char* message);
 */
 import "C"
 import "unsafe"
@@ -104,4 +105,10 @@ func setWindowStatus(localText, remoteText string) {
 func runWindow() {
 	windowRunning.Store(true)
 	C.runEventLoop()
+}
+
+func writeUnifiedLog(message string) {
+	cMsg := C.CString(message)
+	defer C.free(unsafe.Pointer(cMsg))
+	C.logUnified(cMsg)
 }
