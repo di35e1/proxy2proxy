@@ -97,7 +97,7 @@ func handshakeHTTP(conn net.Conn, cfg upstreamConfig, targetHost string, targetP
 func handshakeSOCKS5(conn net.Conn, cfg upstreamConfig, addrType byte, targetHost string, targetPort uint16) (net.Conn, []byte, error) {
 	hasAuth := cfg.user != "" || cfg.pass != ""
 	if hasAuth {
-		if _, err := conn.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+		if _, err := conn.Write([]byte{0x05, 0x01, 0x02}); err != nil {
 			conn.Close()
 			return nil, nil, err
 		}
