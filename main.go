@@ -30,6 +30,10 @@ const (
 	retryInterval    = 30 * time.Second
 	sessionDebounce  = 100 * time.Millisecond
 	configFileName   = "config.json"
+	maxClientConns   = 512
+	acceptErrorDelay = 100 * time.Millisecond
+	statusCheckHost  = "example.com"
+	statusCheckPort  = 443
 )
 
 type proxyProfile struct {
@@ -79,6 +83,13 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func (c *countingConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 var (
 	activeConns          int64
 	bytesDown            int64
@@ -95,6 +106,10 @@ var (
 	globalCfg            upstreamConfig
 	globalListenAddr     string
 	proxyProfiles        []upstreamConfig
+	clientSlots          = make(chan struct{}, maxClientConns)
+	sessionMu            sync.Mutex
+	sessionGeneration    int64
+	activeSessions       = make(map[net.Conn]int64)
 )
 
 func setupFileLogger() {
@@ -186,10 +201,21 @@ func main() {
 	listenAddr := flag.String("listen", defListen, "Локальный адрес SOCKS5")
 	proxyType := flag.String("type", firstProxy.Type, "Тип удалённого прокси: http или socks5")
 	proxyAddr := flag.String("proxy", firstProxy.Addr, "Адрес удалённого прокси (host:port)")
-	proxyUser := flag.String("user", firstProxy.User, "Логин прокси")
-	proxyPass := flag.String("pass", firstProxy.Pass, "Пароль прокси")
+	proxyUser := flag.String("user", "", "Логин прокси")
+	proxyPass := flag.String("pass", "", "Пароль прокси")
 	ifaceName := flag.String("iface", defIface, "Сетевой интерфейс для исходящего трафика")
 	flag.Parse()
+
+	setFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
+	if !setFlags["user"] {
+		*proxyUser = firstProxy.User
+	}
+	if !setFlags["pass"] {
+		*proxyPass = firstProxy.Pass
+	}
 
 	profiles := make([]upstreamConfig, 0, len(extCfg.Proxies))
 	for i, p := range extCfg.Proxies {
@@ -447,6 +473,35 @@ func getCurrentConfigAndIface() (upstreamConfig, string) {
 	return cfg, ifaceLabel
 }
 
+func registerSession(conn net.Conn) {
+	sessionMu.Lock()
+	activeSessions[conn] = sessionGeneration
+	sessionMu.Unlock()
+}
+
+func unregisterSession(conn net.Conn) {
+	sessionMu.Lock()
+	delete(activeSessions, conn)
+	sessionMu.Unlock()
+}
+
+func closeActiveSessions() {
+	sessionMu.Lock()
+	sessionGeneration++
+	currentGeneration := sessionGeneration
+	var oldSessions []net.Conn
+	for conn, generation := range activeSessions {
+		if generation < currentGeneration {
+			oldSessions = append(oldSessions, conn)
+		}
+	}
+	sessionMu.Unlock()
+
+	for _, conn := range oldSessions {
+		conn.Close()
+	}
+}
+
 func switchInterface(bsdName string) {
 	defer recoverAndAlert("Ошибка переключения интерфейса")
 
@@ -463,6 +518,7 @@ func switchInterface(bsdName string) {
 	iface, err := net.InterfaceByName(bsdName)
 	if err != nil {
 		atomic.StoreInt64(&currentIfaceIndex, 0)
+		closeActiveSessions()
 		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 Интерфейс %s не найден в системе", label))
 		setDockBadgeStatus(dockStatusRed)
 		ensureRetryLoop()
@@ -470,6 +526,7 @@ func switchInterface(bsdName string) {
 	}
 
 	atomic.StoreInt64(&currentIfaceIndex, int64(iface.Index))
+	closeActiveSessions()
 	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("⏳ Проверка связи через %s...", label))
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
@@ -490,6 +547,7 @@ func switchProxy(index int) {
 	stateMu.Unlock()
 
 	setWindowInfo(formatRouteInfo(globalListenAddr, cfg, ifaceLabel))
+	closeActiveSessions()
 	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("⏳ Проверка %s (%s)...", cfg.label, ifaceLabel))
 	if !checkRemoteOnce() {
 		ensureRetryLoop()
@@ -536,10 +594,25 @@ func startProxyServer(ifaceName, ifaceDisplay string) {
 		clientConn, err := listener.Accept()
 		if err != nil {
 			log.Printf("Ошибка accept: %v", err)
+			time.Sleep(acceptErrorDelay)
 			continue
 		}
+
+		select {
+		case clientSlots <- struct{}{}:
+		default:
+			clientConn.Close()
+			continue
+		}
+
+		if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+
 		go func(c net.Conn) {
 			defer func() {
+				<-clientSlots
 				if r := recover(); r != nil {
 					log.Printf("Паника в сессии клиента: %v", r)
 				}
@@ -605,11 +678,32 @@ func checkRemoteOnce() bool {
 		setDockBadgeStatus(dockStatusRed)
 		return false
 	}
+	if err := checkUpstreamHandshake(cfg, conn); err != nil {
+		conn.Close()
+		setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🔴 %s (%s): нет связи", cfg.label, label))
+		setDockBadgeStatus(dockStatusRed)
+		return false
+	}
 	conn.Close()
 	ms := time.Since(start).Milliseconds()
 	setWindowStatus(getLocalStatusLine(), fmt.Sprintf("🟢 %s (%s): доступен (%d мс)", cfg.label, label, ms))
 	setDockBadgeStatus(dockStatusGreen)
 	return true
+}
+
+func checkUpstreamHandshake(cfg upstreamConfig, conn net.Conn) error {
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+
+	switch cfg.proxyType {
+	case "http":
+		_, _, err := handshakeHTTP(conn, cfg, statusCheckHost, statusCheckPort)
+		return err
+	case "socks5":
+		_, _, err := handshakeSOCKS5(conn, cfg, 0x03, statusCheckHost, statusCheckPort)
+		return err
+	default:
+		return fmt.Errorf("неподдерживаемый тип прокси: %s", cfg.proxyType)
+	}
 }
 
 func ensureRetryLoop() {
@@ -678,8 +772,10 @@ func dialBound(addr string, ifaceIndex int) (net.Conn, error) {
 
 func handleClient(clientConn net.Conn) {
 	atomic.AddInt64(&activeConns, 1)
+	registerSession(clientConn)
 	notifySessionCountChanged()
 	defer func() {
+		unregisterSession(clientConn)
 		atomic.AddInt64(&activeConns, -1)
 		notifySessionCountChanged()
 		clientConn.Close()
@@ -698,11 +794,25 @@ func handleClient(clientConn net.Conn) {
 	if _, err := io.ReadFull(clientConn, buf[:nMethods]); err != nil {
 		return
 	}
+	noAuthOffered := false
+	for _, method := range buf[:nMethods] {
+		if method == 0x00 {
+			noAuthOffered = true
+			break
+		}
+	}
+	if !noAuthOffered {
+		_, _ = clientConn.Write([]byte{0x05, 0xff})
+		return
+	}
 	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
 	if _, err := io.ReadFull(clientConn, buf[:4]); err != nil {
+		return
+	}
+	if buf[0] != 0x05 || buf[2] != 0x00 {
 		return
 	}
 	if buf[1] != 0x01 {
@@ -741,6 +851,10 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 	targetPort := binary.BigEndian.Uint16(buf[:2])
+	if err := validateTarget(addrType, targetHost, targetPort); err != nil {
+		_, _ = clientConn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 
 	cfg, _ := getCurrentConfigAndIface()
 	ifaceIdx := int(atomic.LoadInt64(&currentIfaceIndex))
@@ -767,13 +881,60 @@ func handleClient(clientConn net.Conn) {
 	errCh := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(upstreamConn, clientConn)
+		if err == nil {
+			closeWrite(upstreamConn)
+		}
 		errCh <- err
 	}()
 	go func() {
 		_, err := io.Copy(clientConn, upstreamConn)
+		if err == nil {
+			closeWrite(clientConn)
+		}
 		errCh <- err
 	}()
-	<-errCh
+	if err := <-errCh; err == nil {
+		<-errCh
+	}
+}
+
+func closeWrite(conn net.Conn) {
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+}
+
+func validateTarget(addrType byte, host string, port uint16) error {
+	if port == 0 {
+		return fmt.Errorf("некорректный порт назначения")
+	}
+
+	switch addrType {
+	case 0x01:
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() == nil {
+			return fmt.Errorf("некорректный IPv4-адрес назначения")
+		}
+	case 0x03:
+		if host == "" || len(host) > 255 {
+			return fmt.Errorf("некорректное доменное имя назначения")
+		}
+		for i := 0; i < len(host); i++ {
+			c := host[i]
+			if c < 0x21 || c > 0x7e || strings.ContainsRune(`:/?#@[]\`, rune(c)) {
+				return fmt.Errorf("некорректное доменное имя назначения")
+			}
+		}
+	case 0x04:
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To16() == nil {
+			return fmt.Errorf("некорректный IPv6-адрес назначения")
+		}
+	default:
+		return fmt.Errorf("неподдерживаемый тип адреса назначения")
+	}
+
+	return nil
 }
 
 func connectUpstream(cfg upstreamConfig, ifaceIdx int, addrType byte, targetHost string, targetPort uint16) (net.Conn, []byte, error) {
@@ -821,7 +982,7 @@ func handshakeHTTP(conn net.Conn, cfg upstreamConfig, targetHost string, targetP
 		conn.Close()
 		return nil, nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		conn.Close()
 		return nil, nil, fmt.Errorf("HTTP статус %d", resp.StatusCode)
 	}
@@ -882,7 +1043,7 @@ func handshakeSOCKS5(conn net.Conn, cfg upstreamConfig, addrType byte, targetHos
 			conn.Close()
 			return nil, nil, err
 		}
-		if resp[1] != 0x00 {
+		if resp[0] != 0x01 || resp[1] != 0x00 {
 			conn.Close()
 			return nil, nil, fmt.Errorf("ошибка авторизации на SOCKS5 (код %d)", resp[1])
 		}
@@ -895,6 +1056,10 @@ func handshakeSOCKS5(conn net.Conn, cfg upstreamConfig, addrType byte, targetHos
 	switch addrType {
 	case 0x01:
 		ip := net.ParseIP(targetHost).To4()
+		if ip == nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("некорректный IPv4-адрес назначения")
+		}
 		req = append(req, ip...)
 	case 0x03:
 		if len(targetHost) > 255 {
@@ -905,6 +1070,10 @@ func handshakeSOCKS5(conn net.Conn, cfg upstreamConfig, addrType byte, targetHos
 		req = append(req, targetHost...)
 	case 0x04:
 		ip := net.ParseIP(targetHost).To16()
+		if ip == nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("некорректный IPv6-адрес назначения")
+		}
 		req = append(req, ip...)
 	}
 
@@ -921,6 +1090,10 @@ func handshakeSOCKS5(conn net.Conn, cfg upstreamConfig, addrType byte, targetHos
 	if _, err := io.ReadFull(conn, replyHeader); err != nil {
 		conn.Close()
 		return nil, nil, err
+	}
+	if replyHeader[0] != 0x05 || replyHeader[2] != 0x00 {
+		conn.Close()
+		return nil, nil, fmt.Errorf("некорректный ответ SOCKS5")
 	}
 	if replyHeader[1] != 0x00 {
 		conn.Close()
