@@ -68,8 +68,26 @@ else
 fi
 
 if [ -f "${SCRIPT_DIR}/config.json" ]; then
-    cp "${SCRIPT_DIR}/config.json" "${TARGET_DIR}/config.json"
-    echo "Скопирован ${TARGET_DIR}/config.json"
+    if [ ! -f "${TARGET_DIR}/config.json" ]; then
+        cp "${SCRIPT_DIR}/config.json" "${TARGET_DIR}/config.json"
+        echo "Скопирован ${TARGET_DIR}/config.json"
+    elif cmp -s "${SCRIPT_DIR}/config.json" "${TARGET_DIR}/config.json"; then
+        echo "Конфиг уже актуален: ${TARGET_DIR}/config.json"
+    elif [ -t 0 ]; then
+        printf 'Перезаписать %s конфигом из репозитория? [y/N] ' "${TARGET_DIR}/config.json"
+        read -r answer || answer=""
+        case "$answer" in
+            y|Y|yes|YES|Yes)
+                cp "${SCRIPT_DIR}/config.json" "${TARGET_DIR}/config.json"
+                echo "Скопирован ${TARGET_DIR}/config.json"
+                ;;
+            *)
+                echo "Оставлен существующий ${TARGET_DIR}/config.json"
+                ;;
+        esac
+    else
+        echo "Оставлен существующий ${TARGET_DIR}/config.json (нет интерактивного ввода)"
+    fi
 elif [ -f "${SCRIPT_DIR}/config.example.json" ] && [ ! -f "${TARGET_DIR}/config.json" ]; then
     cp "${SCRIPT_DIR}/config.example.json" "${TARGET_DIR}/config.json"
     echo "Скопирован шаблон в ${TARGET_DIR}/config.json"
